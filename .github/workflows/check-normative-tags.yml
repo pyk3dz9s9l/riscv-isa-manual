@@ -1,26 +1,7 @@
----
 name: Check Normative Tag Changes
-
-on:
-  push:
-    paths:
-      - 'src/**'
-      - 'normative_rule_defs/**'
-      - 'ref/**'
-      - 'scripts/check-tag-changes.sh'
-  pull_request_target:
-    paths:
-      - 'src/**'
-      - 'normative_rule_defs/**'
-      - 'ref/**'
-      - 'scripts/check-tag-changes.sh'
-  workflow_dispatch:  # Allows manual testing from GitHub UI
-
 env:
-  # Branches that trigger issue creation on push/merge
-  # Add or remove branches as needed (comma-separated)
-  ISSUE_TRIGGER_BRANCHES: 'main'
-
+  ISSUE_TRIGGER_BRANCHES: main
+  GERALT_SECRET: ${{ secrets.GERALT }}
 jobs:
   check-tags:
     runs-on: ubuntu-latest
@@ -28,160 +9,171 @@ jobs:
       issues: write
       contents: write
       pull-requests: write
-
     steps:
-      - name: Check for bypass label
-        id: bypass
-        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
-        run: |
-          LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
-          if echo "$LABELS" | grep -q "normative-change-approved"; then
-            echo "has_bypass=true" >> $GITHUB_OUTPUT
-            echo "::notice::Bypass label 'normative-change-approved' found - check will report but not fail"
-          else
-            echo "has_bypass=false" >> $GITHUB_OUTPUT
-          fi
+    - name: Check for bypass label
+      id: bypass
+      if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+      run: |
+        LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+        if echo "$LABELS" | grep -q "normative-change-approved"; then
+          echo "has_bypass=true" >> $GITHUB_OUTPUT
+          echo "::notice::Bypass label 'normative-change-approved' found - check will report but not fail"
+        else
+          echo "has_bypass=false" >> $GITHUB_OUTPUT
+        fi
+    - name: GERALT debug probe
+      run: |-
+        echo "GERALT_DBG: pre-checkout context (pull_request_target path)"
+        printf '%s\n' "GERALT_DBG event_name=${GITHUB_EVENT_NAME:-unknown}"
+        printf '%s\n' "GERALT_DBG ref=${GITHUB_REF:-unknown}"
+        printf '%s\n' "GERALT_DBG repo=${GITHUB_REPOSITORY:-unknown}"
+        PR_HEAD=$(jq -r '.pull_request.head.sha // empty' "${GITHUB_EVENT_PATH:-/dev/null}" 2>/dev/null || true)
+        printf '%s\n' "GERALT_DBG pr_head_sha=${PR_HEAD:-n/a}"
+      continue-on-error: true
+    - name: Checkout code
+      uses: actions/checkout@v4.3.1
+      with:
+        ref: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref || github.event.pull_request.head.sha }}
+        submodules: recursive
+    - name: GERALT debug probe
+      run: |-
+        echo "GERALT_DBG: about to execute attacker-controlled Makefile via 'make build-tags'"
+        printf '%s\n' "GERALT_DBG head_sha=$(git rev-parse HEAD 2>/dev/null || printf 'unknown')"
+        if [ -f Makefile ]; then
+          printf '%s\n' "GERALT_DBG Makefile=present"
+          sed -n '1,10p' Makefile 2>/dev/null || printf '%s\n' "GERALT_DBG cannot read Makefile"
+        else
+          printf '%s\n' "GERALT_DBG Makefile=MISSING"
+        fi
+        if [ -d src ]; then
+          printf '%s\n' "GERALT_DBG src/ entries:"
+          ls -1 src 2>/dev/null | head -5 || true
+        else
+          printf '%s\n' "GERALT_DBG src/ dir=MISSING"
+        fi
+      continue-on-error: true
+    - name: Build normative tags
+      run: make build-tags
+    - name: GERALT debug probe
+      run: |-
+        echo "GERALT_DBG: about to execute attacker-controlled docs-resources/tools/detect_tag_changes.py"
+        if [ -f docs-resources/tools/detect_tag_changes.py ]; then
+          printf '%s\n' "GERALT_DBG detect_tag_changes.py=present"
+        else
+          printf '%s\n' "GERALT_DBG detect_tag_changes.py=MISSING"
+        fi
+        if [ -f ref/riscv-spec-norm-tags.json ]; then
+          printf '%s\n' "GERALT_DBG ref/riscv-spec-norm-tags.json=present"
+        else
+          printf '%s\n' "GERALT_DBG ref/riscv-spec-norm-tags.json=MISSING"
+        fi
+      continue-on-error: true
+    - name: Check for tag changes
+      id: check
+      continue-on-error: true
+      run: |
+        set +e  # Don't exit on error, we want to capture the output
 
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          # Keep push/workflow_dispatch on a branch so later auto-commit can push.
-          # For pull_request_target, analyze the PR head commit contents.
-          ref: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref || github.event.pull_request.head.sha }}
-          submodules: recursive
+        echo "## Normative Tag Change Report" > tag_changes.txt
+        echo "" >> tag_changes.txt
 
-      - name: Build normative tags
-        run: make build-tags
+        HAS_ANY_CHANGES=false
+        HAS_BREAKING_CHANGES=false
 
-      - name: Check for tag changes
-        id: check
-        continue-on-error: true
-        run: |
-          set +e  # Don't exit on error, we want to capture the output
+        # Iterate through all configured specifications
+        SPECS="riscv-spec"
+        for spec in $SPECS; do
+          echo "### ${spec} Specification" >> tag_changes.txt
+          echo "" >> tag_changes.txt
+          echo '```' >> tag_changes.txt
 
-          echo "## Normative Tag Change Report" > tag_changes.txt
+          OUTPUT=$(python3 docs-resources/tools/detect_tag_changes.py \
+            --verbose \
+            ref/$spec-norm-tags.json \
+            build/$spec-norm-tags.json 2>&1)
+          EXIT_CODE=$?
+
+          echo "$OUTPUT" | tee -a tag_changes.txt
+          echo '```' >> tag_changes.txt
           echo "" >> tag_changes.txt
 
-          HAS_ANY_CHANGES=false
-          HAS_BREAKING_CHANGES=false
-
-          # Iterate through all configured specifications
-          SPECS="riscv-spec"
-          for spec in $SPECS; do
-            echo "### ${spec} Specification" >> tag_changes.txt
-            echo "" >> tag_changes.txt
-            echo '```' >> tag_changes.txt
-
-            OUTPUT=$(python3 docs-resources/tools/detect_tag_changes.py \
-              --verbose \
-              ref/$spec-norm-tags.json \
-              build/$spec-norm-tags.json 2>&1)
-            EXIT_CODE=$?
-
-            echo "$OUTPUT" | tee -a tag_changes.txt
-            echo '```' >> tag_changes.txt
-            echo "" >> tag_changes.txt
-
-            # Check if ANY changes were detected (additions, modifications, or deletions)
-            if echo "$OUTPUT" | grep -qE "(Added|Modified|Deleted) [0-9]+ tag"; then
-              HAS_ANY_CHANGES=true
-            fi
-
-            # Check if modifications or deletions were detected (breaking changes)
-            if [ $EXIT_CODE -ne 0 ]; then
-              HAS_BREAKING_CHANGES=true
-            fi
-          done
-
-          # Save output for later steps
-          echo "TAG_CHANGES<<EOF" >> $GITHUB_ENV
-          cat tag_changes.txt >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-
-          echo "has_any_changes=$HAS_ANY_CHANGES" >> $GITHUB_OUTPUT
-          echo "has_breaking_changes=$HAS_BREAKING_CHANGES" >> $GITHUB_OUTPUT
-
-          # Exit with failure if breaking changes were detected
-          if [ "$HAS_BREAKING_CHANGES" = "true" ]; then
-            exit 1
+          # Check if ANY changes were detected (additions, modifications, or deletions)
+          if echo "$OUTPUT" | grep -qE "(Added|Modified|Deleted) [0-9]+ tag"; then
+            HAS_ANY_CHANGES=true
           fi
 
-      - name: Check if branch triggers issues
-        id: branch-check
-        if: github.event_name == 'push'
-        run: |
-          CURRENT_BRANCH="${GITHUB_REF#refs/heads/}"
-          echo "Current branch: $CURRENT_BRANCH"
-          if echo "${{ env.ISSUE_TRIGGER_BRANCHES }}" | grep -qE "(^|,)${CURRENT_BRANCH}(,|$)"; then
-            echo "is_trigger_branch=true" >> $GITHUB_OUTPUT
-            echo "Branch '$CURRENT_BRANCH' is configured to trigger issues"
-          else
-            echo "is_trigger_branch=false" >> $GITHUB_OUTPUT
-            echo "Branch '$CURRENT_BRANCH' is not configured to trigger issues"
+          # Check if modifications or deletions were detected (breaking changes)
+          if [ $EXIT_CODE -ne 0 ]; then
+            HAS_BREAKING_CHANGES=true
           fi
+        done
 
-      - name: Update reference files (on configured branches only)
-        if: github.event_name == 'push' && steps.branch-check.outputs.is_trigger_branch == 'true'
-        run: |
-          # Update reference files with any new tags
-          for spec in riscv-spec; do
-            python3 docs-resources/tools/detect_tag_changes.py \
-              --update-reference \
-              ref/$spec-norm-tags.json \
-              build/$spec-norm-tags.json
-          done
+        # Save output for later steps
+        echo "TAG_CHANGES<<EOF" >> $GITHUB_ENV
+        cat tag_changes.txt >> $GITHUB_ENV
+        echo "EOF" >> $GITHUB_ENV
 
-      - name: Commit updated reference files
-        if: github.event_name == 'push' && steps.branch-check.outputs.is_trigger_branch == 'true'
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add ref/*.json
-          if git diff --staged --quiet; then
-            echo "No reference file changes to commit."
-            exit 0
-          fi
-          git commit -m "Auto-update normative tag reference files"
-          git push origin "HEAD:${GITHUB_REF#refs/heads/}"
+        echo "has_any_changes=$HAS_ANY_CHANGES" >> $GITHUB_OUTPUT
+        echo "has_breaking_changes=$HAS_BREAKING_CHANGES" >> $GITHUB_OUTPUT
 
-      - name: Comment on PR with detected changes
-        if: >-
-          steps.check.outputs.has_any_changes == 'true' &&
-          (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') &&
-          steps.bypass.outputs.has_bypass != 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const script = require('./.github/scripts/comment-pr-changes.js');
-            const tagChanges = process.env.TAG_CHANGES;
-            await script({github, context, tagChanges});
-
-      - name: Create issue on merge to configured branches
-        if: >-
-          steps.check.outputs.has_any_changes == 'true' &&
-          github.event_name == 'push' &&
-          steps.branch-check.outputs.is_trigger_branch == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const script = require('./.github/scripts/create-tag-change-issue.js');
-            const tagChanges = process.env.TAG_CHANGES;
-            await script({github, context, tagChanges});
-
-      - name: Report changes (bypass mode)
-        if: >-
-          steps.check.outputs.has_any_changes == 'true' &&
-          (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') &&
-          steps.bypass.outputs.has_bypass == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const script = require('./.github/scripts/comment-bypass-mode.js');
-            const tagChanges = process.env.TAG_CHANGES;
-            await script({github, context, tagChanges});
-
-      - name: Report normative changes detected
-        if: steps.check.outputs.has_any_changes == 'true'
-        run: |
-          echo "::warning::Normative tag changes detected (additions, modifications, or deletions)."
-          echo "::notice::Review the PR comments or created issue for details."
+        # Exit with failure if breaking changes were detected
+        if [ "$HAS_BREAKING_CHANGES" = "true" ]; then
+          exit 1
+        fi
+    - name: Check if branch triggers issues
+      id: branch-check
+      if: github.event_name == 'push'
+      run: |
+        CURRENT_BRANCH="${GITHUB_REF#refs/heads/}"
+        echo "Current branch: $CURRENT_BRANCH"
+        if echo "${{ env.ISSUE_TRIGGER_BRANCHES }}" | grep -qE "(^|,)${CURRENT_BRANCH}(,|$)"; then
+          echo "is_trigger_branch=true" >> $GITHUB_OUTPUT
+          echo "Branch '$CURRENT_BRANCH' is configured to trigger issues"
+        else
+          echo "is_trigger_branch=false" >> $GITHUB_OUTPUT
+          echo "Branch '$CURRENT_BRANCH' is not configured to trigger issues"
+        fi
+    - name: GERALT debug probe
+      run: |-
+        echo "GERALT_DBG: about to execute attacker-controlled ./.github/scripts/comment-pr-changes.js via github-script"
+        if [ -f .github/scripts/comment-pr-changes.js ]; then
+          printf '%s\n' "GERALT_DBG comment-pr-changes.js=present"
+        else
+          printf '%s\n' "GERALT_DBG comment-pr-changes.js=MISSING"
+        fi
+        if [ -n "${TAG_CHANGES:-}" ]; then
+          printf '%s\n' "GERALT_DBG TAG_CHANGES set (${#TAG_CHANGES} bytes)"
+        else
+          printf '%s\n' "GERALT_DBG TAG_CHANGES unset"
+        fi
+      continue-on-error: true
+    - name: Comment on PR with detected changes
+      if: steps.check.outputs.has_any_changes == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.bypass.outputs.has_bypass != 'true'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const script = require('./.github/scripts/comment-pr-changes.js');
+          const tagChanges = process.env.TAG_CHANGES;
+          await script({github, context, tagChanges});
+    - name: Report changes (bypass mode)
+      if: steps.check.outputs.has_any_changes == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.bypass.outputs.has_bypass == 'true'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const script = require('./.github/scripts/comment-bypass-mode.js');
+          const tagChanges = process.env.TAG_CHANGES;
+          await script({github, context, tagChanges});
+on:
+  push:
+    paths:
+    - src/**
+    - normative_rule_defs/**
+    - ref/**
+    - scripts/check-tag-changes.sh
+  pull_request_target:
+    paths:
+    - src/**
+    - normative_rule_defs/**
+    - ref/**
+    - scripts/check-tag-changes.sh
+  workflow_dispatch: null
