@@ -1,3 +1,1 @@
-[submodule "docs-resources"]
-	path = docs-resources
-	url = https://github.com/riscv/docs-resources
+# submodules intentionally disabled for this branch
