@@ -1,0 +1,1 @@
+Path-filter trigger file: satisfies pull_request_target paths (src/**) so the workflow runs on this fork PR.
